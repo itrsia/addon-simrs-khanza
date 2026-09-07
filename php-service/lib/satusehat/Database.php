@@ -1834,10 +1834,11 @@ class SatuSehatDatabase
 
         $selectCols = implode(', ', array_map(fn($c) => "pr.{$c}", $valueCols));
         // pemeriksaan_ranap has no lingkar_perut column (legacy: LP was Ralan-only).
-        // The Ranap branch emits NULL for it so the UNION column counts match
-        // and the processor skips LP for Ranap rows (same as legacy).
-        $valueColsRanap = array_values(array_diff($valueCols, ['lingkar_perut']));
-        $selectColsRanap = implode(', ', array_map(fn($c) => "pi.{$c}", $valueColsRanap)) . ', NULL as lingkar_perut';
+        // Map each column in identical positional order so UNION ALL columns never shift!
+        $selectColsRanap = implode(', ', array_map(
+            fn($c) => $c === 'lingkar_perut' ? 'NULL as lingkar_perut' : "pi.{$c}",
+            $valueCols
+        ));
         $syncedSelect = [];
         $j = 1;
         foreach ($stateTables as $ttvType => $table) {
