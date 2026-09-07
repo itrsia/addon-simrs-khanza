@@ -965,7 +965,7 @@ class SatuSehatPayloadBuilder
     /**
      * Build Observation-TTV payload dynamically based on dictionary definition.
      */
-    public static function observationTTV(array $p, string $idPasien, string $idDokter, array $def): array
+    public static function observationTTV(array $p, string $idPasien, string $idDokter, array $def, string $idObservation = ''): array
     {
         $waktuObservasi = self::sanitizeDateTime($p['tgl_observasi'] ?? null, $p['jam_observasi'] ?? null, $p);
 
@@ -1094,6 +1094,10 @@ class SatuSehatPayloadBuilder
                     ]
                 ]
             ];
+        }
+
+        if (!empty($idObservation)) {
+            $payload['id'] = $idObservation;
         }
 
         return $payload;

@@ -56,16 +56,40 @@ class SatuSehatObservationTTVProcessor
         foreach (ObservationTTVDictionary::getDefinitions() as $ttvType => $def) {
             $dbCol = $def['db_column'];
             $value = $row[$dbCol] ?? '';
+
+            // Lingkar Perut fallback logic:
+            // Ralan: if missing/empty -> fallback to "0" (Rule 2B.1)
+            // Ranap: if missing/empty and no existing observation -> skip
+            if ($ttvType === 'lp') {
+                if ($row['status'] === 'Ralan' && ($value === null || trim((string) $value) === '' || $value === '-')) {
+                    $value = '0';
+                }
+            }
+
+            // For existing observations with empty value: fallback to 0 if quantity
+            $existingId = !empty($row[$ttvType . '_synced']) && $row[$ttvType . '_synced'] !== '-' ? (string) $row[$ttvType . '_synced'] : null;
+            if ($existingId !== null && ($value === null || trim((string) $value) === '' || $value === '-')) {
+                if ($def['type'] === 'quantity') {
+                    $value = '0';
+                }
+            }
+
             if ($value === null || trim((string) $value) === '' || $value === '-') {
                 continue; // this row carries no value for this type
             }
 
-            if (!empty($row[$ttvType . '_synced'])) {
-                continue; // already sent in a previous run
+            $currentHash = md5((string) $value);
+            $localStateData = $this->db->getObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, (string) ($row['status'] ?? ''));
+            $localStatus = $localStateData['status'] ?? null;
+            $localHash   = $localStateData['val_hash'] ?? null;
+
+            if (in_array($localStatus, ['privacy_error', 'failed_rule', 'invalid_code'], true)) {
+                $delta['skip']++;
+                continue;
             }
 
-            $localState = $this->db->getObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, (string) ($row['status'] ?? ''));
-            if ($localState === 'sent' || in_array($localState, ['privacy_error', 'failed_rule', 'invalid_code'], true)) {
+            // If already synced and value hash matches -> no change needed
+            if ($existingId !== null && $localHash !== null && $localHash === $currentHash) {
                 $delta['skip']++;
                 continue;
             }
@@ -80,7 +104,8 @@ class SatuSehatObservationTTVProcessor
                 $row + ['value' => $value],
                 $idPasien,
                 $idDokter,
-                $def
+                $def,
+                $existingId ?? ''
             );
 
             if (empty($payload)) {
@@ -89,64 +114,82 @@ class SatuSehatObservationTTVProcessor
                 continue;
             }
 
-            $this->log->info("  [POST] {$noRawat} / {$ttvType} = {$value}");
-            $result = $this->api->post('/Observation', $payload);
+            // Determine action: PUT if already has remote ID, POST if new
+            if ($existingId !== null) {
+                // ─── ACTION B: PUT (In-place update) ───
+                $this->log->info("  [PUT] {$noRawat} / {$ttvType} ({$existingId}) = {$value}");
+                $result = $this->api->put("/Observation/{$existingId}", $payload);
 
-            if ($result['success'] && isset($result['data']['id'])) {
-                $idObservation = $result['data']['id'];
-
-                $this->db->saveObservationTTV(
-                    $def['state_table'],
-                    $def['state_id_col'] ?? 'id_observation',
-                    $noRawat,
-                    $tglObs,
-                    $jamObs,
-                    $row['status'],
-                    $idObservation
-                );
-                $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, 'sent', (string) ($row['status'] ?? ''));
-                $this->log->info("    ✓ Created {$idObservation}");
-                $delta['success']++;
+                if ($result['success']) {
+                    $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, 'sent', (string) ($row['status'] ?? ''), $currentHash);
+                    $this->log->info("    ✓ Updated {$existingId} via PUT");
+                    $delta['success']++;
+                } else {
+                    $errorMessage = \SatuSehatClient::extractErrorMsg($result);
+                    $this->log->warning("    ✗ PUT Failed -> " . $errorMessage);
+                    $delta['fail']++;
+                }
             } else {
-                $errorMessage = \SatuSehatClient::extractErrorMsg($result);
+                // ─── ACTION A: POST (New observation) ───
+                $this->log->info("  [POST] {$noRawat} / {$ttvType} = {$value}");
+                $result = $this->api->post('/Observation', $payload);
 
-                // Duplicate handling for Observation
-                if (stripos($errorMessage, 'duplicate') !== false || $result['code'] === 409) {
-                    $this->log->warning("    ! Duplicated. Attempting to recover...");
-                    $idObservation = $this->resolveDuplicateObservation($idPasien, $row['id_encounter'] ?? '', $def['code']);
+                if ($result['success'] && isset($result['data']['id'])) {
+                    $idObservation = $result['data']['id'];
 
-                    if ($idObservation) {
-                        $this->db->saveObservationTTV(
-                            $def['state_table'],
-                            $def['state_id_col'] ?? 'id_observation',
-                            $noRawat,
-                            $tglObs,
-                            $jamObs,
-                            $row['status'],
-                            $idObservation
-                        );
-                        $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, 'sent', (string) ($row['status'] ?? ''));
-                        $this->log->info("    ✓ Recovered {$idObservation} from Server");
-                        $delta['success']++;
+                    $this->db->saveObservationTTV(
+                        $def['state_table'],
+                        $def['state_id_col'] ?? 'id_observation',
+                        $noRawat,
+                        $tglObs,
+                        $jamObs,
+                        $row['status'],
+                        $idObservation
+                    );
+                    $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, 'sent', (string) ($row['status'] ?? ''), $currentHash);
+                    $this->log->info("    ✓ Created {$idObservation}");
+                    $delta['success']++;
+                } else {
+                    $errorMessage = \SatuSehatClient::extractErrorMsg($result);
+
+                    // Duplicate handling for Observation
+                    if (stripos($errorMessage, 'duplicate') !== false || $result['code'] === 409) {
+                        $this->log->warning("    ! Duplicated. Attempting to recover...");
+                        $idObservation = $this->resolveDuplicateObservation($idPasien, $row['id_encounter'] ?? '', $def['code']);
+
+                        if ($idObservation) {
+                            $this->db->saveObservationTTV(
+                                $def['state_table'],
+                                $def['state_id_col'] ?? 'id_observation',
+                                $noRawat,
+                                $tglObs,
+                                $jamObs,
+                                $row['status'],
+                                $idObservation
+                            );
+                            $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, 'sent', (string) ($row['status'] ?? ''), $currentHash);
+                            $this->log->info("    ✓ Recovered {$idObservation} from Server");
+                            $delta['success']++;
+                        } else {
+                            $this->log->error("    ✗ Failed to recover duplicate.");
+                            $delta['fail']++;
+                        }
                     } else {
-                        $this->log->error("    ✗ Failed to recover duplicate.");
+                        $this->log->warning("    ✗ Failed -> " . $errorMessage);
+
+                        // Categorize and cache permanent/terminal failures
+                        $state = 'fail';
+                        if (stripos($errorMessage, 'consent') !== false || stripos($errorMessage, 'privacy') !== false) {
+                            $state = 'privacy_error';
+                        } elseif (stripos($errorMessage, 'rule') !== false || stripos($errorMessage, 'RuleNumber') !== false) {
+                            $state = 'failed_rule';
+                        } elseif (stripos($errorMessage, 'code') !== false || stripos($errorMessage, 'system') !== false || stripos($errorMessage, 'terminology') !== false) {
+                            $state = 'invalid_code';
+                        }
+
+                        $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, $state, (string) ($row['status'] ?? ''), $currentHash);
                         $delta['fail']++;
                     }
-                } else {
-                    $this->log->warning("    ✗ Failed -> " . $errorMessage);
-
-                    // Categorize and cache permanent/terminal failures
-                    $state = 'fail';
-                    if (stripos($errorMessage, 'consent') !== false || stripos($errorMessage, 'privacy') !== false) {
-                        $state = 'privacy_error';
-                    } elseif (stripos($errorMessage, 'rule') !== false || stripos($errorMessage, 'RuleNumber') !== false) {
-                        $state = 'failed_rule';
-                    } elseif (stripos($errorMessage, 'code') !== false || stripos($errorMessage, 'system') !== false || stripos($errorMessage, 'terminology') !== false) {
-                        $state = 'invalid_code';
-                    }
-
-                    $this->db->updateObservationLocalState($ttvType, $noRawat, $tglObs, $jamObs, $state, (string) ($row['status'] ?? ''));
-                    $delta['fail']++;
                 }
             }
         }

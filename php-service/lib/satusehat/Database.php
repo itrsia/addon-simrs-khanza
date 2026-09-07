@@ -111,8 +111,16 @@ class SatuSehatDatabase
         $this->sqliteExec("CREATE TABLE IF NOT EXISTS observationttv_state (
             composite_key VARCHAR(100) PRIMARY KEY,
             status VARCHAR(20),
+            val_hash VARCHAR(40),
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )");
+
+        // Add val_hash column if upgrading existing SQLite db
+        try {
+            $this->sqliteExec("ALTER TABLE observationttv_state ADD COLUMN val_hash VARCHAR(40)");
+        } catch (\Throwable $e) {
+            // Already exists, ignore
+        }
 
         // Table for Procedure state tracking
         $this->sqliteExec("CREATE TABLE IF NOT EXISTS procedure_state (
@@ -1499,32 +1507,35 @@ class SatuSehatDatabase
      * observations are silently never sent. Legacy rows keyed WITHOUT status
      * are still honored on read so pre-upgrade 'sent' states survive.
      */
-    public function getObservationLocalState(string $ttvType, string $noRawat, string $tgl, string $jam, string $status = ''): ?string
+    public function getObservationLocalState(string $ttvType, string $noRawat, string $tgl, string $jam, string $status = ''): array
     {
         if ($status !== '') {
             $compositeKey = "{$ttvType}_{$noRawat}_{$tgl}_{$jam}_{$status}";
-            $stmt = $this->sqliteQuery("SELECT status FROM observationttv_state WHERE composite_key = :ck", ['ck' => $compositeKey]);
+            $stmt = $this->sqliteQuery("SELECT status, val_hash FROM observationttv_state WHERE composite_key = :ck", ['ck' => $compositeKey]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
             if ($row) {
-                return $row['status'];
+                return ['status' => $row['status'], 'val_hash' => $row['val_hash'] ?? null];
             }
         }
         // Legacy fallback (pre-status key).
         $compositeKey = "{$ttvType}_{$noRawat}_{$tgl}_{$jam}";
-        $stmt = $this->sqliteQuery("SELECT status FROM observationttv_state WHERE composite_key = :ck", ['ck' => $compositeKey]);
+        $stmt = $this->sqliteQuery("SELECT status, val_hash FROM observationttv_state WHERE composite_key = :ck", ['ck' => $compositeKey]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
-        return $row ? $row['status'] : null;
+        if ($row) {
+            return ['status' => $row['status'], 'val_hash' => $row['val_hash'] ?? null];
+        }
+        return ['status' => null, 'val_hash' => null];
     }
 
-    public function updateObservationLocalState(string $ttvType, string $noRawat, string $tgl, string $jam, string $status, string $stateRawat = ''): void
+    public function updateObservationLocalState(string $ttvType, string $noRawat, string $tgl, string $jam, string $status, string $stateRawat = '', ?string $valHash = null): void
     {
         $suffix = $stateRawat !== '' ? "_{$stateRawat}" : '';
         $compositeKey = "{$ttvType}_{$noRawat}_{$tgl}_{$jam}{$suffix}";
         $stmt = $this->sqliteQuery("
-            INSERT INTO observationttv_state (composite_key, status, updated_at) 
-            VALUES (:ck, :st, CURRENT_TIMESTAMP)
-            ON CONFLICT(composite_key) DO UPDATE SET status = excluded.status, updated_at = CURRENT_TIMESTAMP
-        ", ['ck' => $compositeKey, 'st' => $status]);
+            INSERT INTO observationttv_state (composite_key, status, val_hash, updated_at)
+            VALUES (:ck, :st, :vh, CURRENT_TIMESTAMP)
+            ON CONFLICT(composite_key) DO UPDATE SET status = excluded.status, val_hash = excluded.val_hash, updated_at = CURRENT_TIMESTAMP
+        ", ['ck' => $compositeKey, 'st' => $status, 'vh' => $valHash]);
     }
 
     // ─── OBSERVATION LAB PK/MB STATE TRACKING ──────────────────────────────────
@@ -1870,7 +1881,6 @@ class SatuSehatDatabase
             {$stateJoinSuffix}
             WHERE rp.tgl_registrasi BETWEEN :df AND :dt
               AND (" . implode(' OR ', $hasValue) . ")
-              AND (" . implode(' OR ', $syncedOr) . ")
               {$keysetRalan}
 
             UNION ALL
@@ -1897,7 +1907,6 @@ class SatuSehatDatabase
             {$ranapJoins}
             WHERE rp.tgl_registrasi BETWEEN :df2 AND :dt2
               AND (" . implode(' OR ', $hasValueRanap) . ")
-              AND (" . implode(' OR ', $syncedOr) . ")
               {$keysetRanap}
         ";
 
