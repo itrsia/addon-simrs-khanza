@@ -14,6 +14,14 @@ use SatusehatPanel\Util\IdempotencyStore;
 
 class SendController
 {
+    private static ?\SatuSehatClient $clientForTesting = null;
+
+    /** @internal Inject a client mock for testing. */
+    public static function setClientForTesting(?\SatuSehatClient $client): void
+    {
+        self::$clientForTesting = $client;
+    }
+
     public const RESOURCE_DEPENDENCY_ORDER = [
         'EpisodeOfCare',
         'Encounter',
@@ -59,15 +67,34 @@ class SendController
     ];
 
     /**
+     * Sort resources topologically into canonical FHIR dependency order.
+     *
+     * @param string[] $resources
+     * @return string[]
+     */
+    public static function sortResources(array $resources): array
+    {
+        usort($resources, function ($a, $b) {
+            $idxA = array_search($a, self::RESOURCE_DEPENDENCY_ORDER, true);
+            $idxB = array_search($b, self::RESOURCE_DEPENDENCY_ORDER, true);
+            $posA = $idxA !== false ? $idxA : 999;
+            $posB = $idxB !== false ? $idxB : 999;
+            return $posA <=> $posB;
+        });
+
+        return array_values($resources);
+    }
+
+    /**
      * Build a FHIR transaction Bundle from checked resources and POST it.
      *
      * Request body: { no_rawat, resources: ['Encounter', 'Condition', ...] }
      * Each entry has a urn:uuid fullUrl + request.method=POST + resource.
      * Mirrors the SATUSEHAT Postman Bundle transaction structure.
      */
-    public static function sendBundle(string $noRawat): array
+    public static function sendBundle(string $noRawat, ?array $inputOverride = null): array
     {
-        $input = json_decode(file_get_contents('php://input'), true);
+        $input = $inputOverride ?? json_decode((string) file_get_contents('php://input'), true);
         if (!is_array($input)) {
             return ['success' => false, 'error' => 'Invalid JSON body'];
         }
@@ -98,13 +125,7 @@ class SendController
         }
 
         // Sort resources topologically into canonical FHIR dependency order
-        usort($resources, function ($a, $b) {
-            $idxA = array_search($a, self::RESOURCE_DEPENDENCY_ORDER, true);
-            $idxB = array_search($b, self::RESOURCE_DEPENDENCY_ORDER, true);
-            $posA = $idxA !== false ? $idxA : 999;
-            $posB = $idxB !== false ? $idxB : 999;
-            return $posA <=> $posB;
-        });
+        $resources = self::sortResources($resources);
 
         // Billing gate — the CLI only POSTs clinical resources for paid
         // visits (status_bayar = 'Sudah Bayar'). The panel list color-codes
@@ -895,6 +916,10 @@ class SendController
      */
     private static function getClient(): \SatuSehatClient
     {
+        if (self::$clientForTesting !== null) {
+            return self::$clientForTesting;
+        }
+
         $config = \CredentialLocator::buildSatuSehatConfig();
 
         $log = new \Logger($config->logDir, 'panel_send');

@@ -20,6 +20,12 @@ class Database
         self::$sqlite = null;
     }
 
+    /** @internal — inject a PDO instance (e.g. in-memory SQLite) for MySQL in tests. */
+    public static function setMysqlForTesting(?PDO $pdo): void
+    {
+        self::$mysql = $pdo;
+    }
+
     public static function getSqlite(): PDO
     {
         if (self::$sqlite === null) {

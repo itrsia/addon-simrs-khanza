@@ -34,8 +34,13 @@ class PayloadAdapter
      * @return array List of FHIR payloads. Empty array if no data exists.
      *               Each item is a complete FHIR resource ready for a Bundle entry.
      */
-    public static function build(string $resource, string $noRawat, array $patient, array $refs = [], bool $includeSent = false): array
-    {
+    public static function build(
+        string $resource,
+        string $noRawat,
+        array $patient,
+        array $refs = [],
+        bool $includeSent = false
+    ): array {
         $db = Database::getMysql();
         $orgId = (string) Config::get('satusehat.org_id', '');
 
@@ -107,10 +112,27 @@ class PayloadAdapter
     {
         if (empty($nikDokter)) return '';
 
+        // If employee code (e.g. D001) was passed instead of 16-digit KTP, resolve no_ktp first
+        if (!preg_match('/^[0-9]{16}$/', $nikDokter)) {
+            try {
+                $stmtPeg = $db->prepare("SELECT no_ktp FROM pegawai WHERE nik = ? LIMIT 1");
+                $stmtPeg->execute([$nikDokter]);
+                $ktp = trim((string) ($stmtPeg->fetchColumn() ?: ''));
+                if (preg_match('/^[0-9]{16}$/', $ktp)) {
+                    $nikDokter = $ktp;
+                }
+            } catch (\Throwable $e) { /* ignore if pegawai table absent */ }
+        }
+
         $stmt = $db->prepare("SELECT ihspegawai FROM satu_sehat_ihs_practitioner WHERE nikpegawai = ? LIMIT 1");
         $stmt->execute([$nikDokter]);
         $ihs = trim((string) ($stmt->fetchColumn() ?: ''));
         if ($ihs !== '' && $ihs !== '-') return $ihs;
+
+        // If not a valid 16-digit NIK, avoid querying upstream SATUSEHAT API
+        if (!preg_match('/^[0-9]{16}$/', $nikDokter)) {
+            return 'N-DOKTER-IHS-PLACEHOLDER';
+        }
 
         try {
             $client = self::getClient();
@@ -118,7 +140,12 @@ class PayloadAdapter
             $entry = $result['data']['entry'][0]['resource'] ?? null;
             if ($result['success'] && $entry && isset($entry['id'])) {
                 $ihs = $entry['id'];
-                $upd = $db->prepare("INSERT INTO satu_sehat_ihs_practitioner (nikpegawai, ihspegawai) VALUES (?, ?) ON DUPLICATE KEY UPDATE ihspegawai = VALUES(ihspegawai)");
+                $driver = $db->getAttribute(\PDO::ATTR_DRIVER_NAME);
+                if ($driver === 'sqlite') {
+                    $upd = $db->prepare("INSERT INTO satu_sehat_ihs_practitioner (nikpegawai, ihspegawai) VALUES (?, ?) ON CONFLICT(nikpegawai) DO UPDATE SET ihspegawai = excluded.ihspegawai");
+                } else {
+                    $upd = $db->prepare("INSERT INTO satu_sehat_ihs_practitioner (nikpegawai, ihspegawai) VALUES (?, ?) ON DUPLICATE KEY UPDATE ihspegawai = VALUES(ihspegawai)");
+                }
                 $upd->execute([$nikDokter, $ihs]);
                 return $ihs;
             }
@@ -232,9 +259,23 @@ class PayloadAdapter
         return new \SatuSehatClient($config, $log);
     }
 
-    private static function getIhsIds(array $patient): array
+    public static function getIhsIds(\PDO|array $dbOrPatient, string|array|null $noRawatOrPatient = null, ?array $patient = null): array
     {
-        $db = Database::getMysql();
+        if ($dbOrPatient instanceof \PDO) {
+            $db = $dbOrPatient;
+            if (is_array($noRawatOrPatient)) {
+                $patient = $noRawatOrPatient;
+            } else {
+                $patient = $patient ?? [];
+                if ($noRawatOrPatient !== null && $noRawatOrPatient !== '') {
+                    $patient['no_rawat'] = (string) $noRawatOrPatient;
+                }
+            }
+        } else {
+            $patient = $dbOrPatient;
+            $db = Database::getMysql();
+        }
+
         $ihsPasien = '';
         if (!empty($patient['ihs_pasien']) && !str_contains($patient['ihs_pasien'], 'PLACEHOLDER')) {
             $ihsPasien = $patient['ihs_pasien'];
@@ -274,7 +315,12 @@ class PayloadAdapter
 
         if ($ihsPasien === '') $ihsPasien = 'P-PASIEN-IHS-PLACEHOLDER';
         if ($ihsDokter === '') $ihsDokter = 'N-DOKTER-IHS-PLACEHOLDER';
-        return ['pasien' => $ihsPasien, 'dokter' => $ihsDokter];
+        return [
+            'pasien'     => $ihsPasien,
+            'dokter'     => $ihsDokter,
+            'ihs_pasien' => $ihsPasien,
+            'ihs_dokter' => $ihsDokter,
+        ];
     }
 
     private static function fetchEncounterRow(array $patient): array
@@ -392,7 +438,7 @@ class PayloadAdapter
     // Condition (MULTI-ROW: ALL diagnoses for this visit) + chief complaints
     // (keluhan utama, official rajal pattern) — merged under one type.
 
-    private static function buildConditionMulti(\PDO $db, array $patient, bool $includeSent = false): array
+    public static function buildConditionMulti(\PDO $db, array $patient, bool $includeSent = false): array
     {
         return array_merge(
             self::buildDiagnosisMulti($db, $patient, $includeSent),
@@ -400,9 +446,9 @@ class PayloadAdapter
         );
     }
 
-    private static function buildDiagnosisMulti(\PDO $db, array $patient, bool $includeSent = false): array
+    public static function buildDiagnosisMulti(\PDO $db, array $patient, bool $includeSent = false): array
     {
-        $ihs = self::getIhsIds($patient);
+        $ihs = self::getIhsIds($db, $patient['no_rawat'] ?? '', $patient);
         $sentClause = $includeSent ? "" : "AND (ssc.id_condition IS NULL OR ssc.id_condition IN ('', '-'))";
         $stmt = $db->prepare("
             SELECT dp.*, pn.nm_penyakit, sse.id_encounter, pg.nama AS nm_dokter, IFNULL(ssc.id_condition, '') AS id_condition
@@ -421,16 +467,29 @@ class PayloadAdapter
 
         $payloads = [];
         foreach ($rows as $row) {
-            $row['tgl_registrasi'] = $patient['tgl_registrasi'];
-            $row['jam_reg'] = $patient['jam_reg'];
-            $row['nm_pasien'] = $patient['nm_pasien'];
-            $row['no_ktp'] = $patient['no_ktp'];
+            $row['tgl_registrasi'] = $patient['tgl_registrasi'] ?? ($row['tgl_registrasi'] ?? null);
+            $row['jam_reg'] = $patient['jam_reg'] ?? ($row['jam_reg'] ?? null);
+            $row['nm_pasien'] = $patient['nm_pasien'] ?? '';
+            $row['no_ktp'] = $patient['no_ktp'] ?? '';
             $p = \SatuSehatPayloadBuilder::condition($row, $ihs['pasien'], $row['id_condition'] ?? '', $ihs['dokter'] ?: null, $row['nm_dokter'] ?? '');
             if ($p !== null) {
                 // Onset (T22): the diagnosis is dated by the visit.
                 $p['onsetDateTime'] = \SatuSehatPayloadBuilder::sanitizeDateTime(
                     $row['tgl_registrasi'] ?? null, $row['jam_reg'] ?? null, $row
                 );
+
+                // Rule 10403 guard: Condition recordedDate MUST be full ISO-8601 dateTime with timezone
+                if (isset($p['recordedDate']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $p['recordedDate'])) {
+                    $p['recordedDate'] .= 'T00:00:00+07:00';
+                }
+                if (empty($p['recordedDate'])) {
+                    $p['recordedDate'] = $p['onsetDateTime'];
+                }
+
+                if (isset($p['onsetDateTime']) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $p['onsetDateTime'])) {
+                    $p['onsetDateTime'] .= 'T00:00:00+07:00';
+                }
+
                 // Attach composite persist keys for SendController
                 $p['_panel_persist_keys'] = [
                     'table' => 'satu_sehat_condition',
@@ -449,10 +508,10 @@ class PayloadAdapter
     // satu_sehat_condition with kd_penyakit='CHIEF-COMPLAINT' so re-sends
     // do not duplicate.
 
-    private static function buildChiefComplaintMulti(\PDO $db, array $patient, bool $includeSent = false): array
+    public static function buildChiefComplaintMulti(\PDO $db, array $patient, bool $includeSent = false): array
     {
-        $ihs = self::getIhsIds($patient);
-        $noRawat = $patient['no_rawat'];
+        $ihs = self::getIhsIds($db, $patient['no_rawat'] ?? '', $patient);
+        $noRawat = $patient['no_rawat'] ?? '';
         $payloads = [];
         $sentClause = $includeSent ? "" : "AND (ssc.id_condition IS NULL OR ssc.id_condition IN ('', '-'))";
 
@@ -460,8 +519,10 @@ class PayloadAdapter
             $stmt = $db->prepare("
                 SELECT pr.no_rawat, pr.keluhan, pr.tgl_perawatan, pr.jam_rawat,
                        sse.id_encounter, pg.nama AS nm_dokter,
+                       rp.tgl_registrasi, rp.jam_reg,
                        IFNULL(ssc.id_condition, '') AS id_condition
                 FROM {$table} pr
+                LEFT JOIN reg_periksa rp ON rp.no_rawat = pr.no_rawat
                 LEFT JOIN satu_sehat_encounter sse ON sse.no_rawat = pr.no_rawat
                 LEFT JOIN pegawai pg ON pg.nik = pr.nip
                 LEFT JOIN satu_sehat_condition ssc
@@ -473,6 +534,40 @@ class PayloadAdapter
             ");
             $stmt->execute([$status, $noRawat]);
             foreach ($stmt->fetchAll() as $row) {
+                if (empty($row['tgl_registrasi']) && !empty($patient['tgl_registrasi'])) {
+                    $row['tgl_registrasi'] = $patient['tgl_registrasi'];
+                }
+                if (empty($row['jam_reg']) && !empty($patient['jam_reg'])) {
+                    $row['jam_reg'] = $patient['jam_reg'];
+                }
+
+                $onset = \SatuSehatPayloadBuilder::sanitizeDateTime(
+                    $row['tgl_perawatan'] ?? null, $row['jam_rawat'] ?? null, $row
+                );
+                $recorded = \SatuSehatPayloadBuilder::sanitizeDateTime(
+                    $row['tgl_perawatan'] ?? null, $row['jam_rawat'] ?? null, $row
+                );
+
+                // Rule 10403 guard: Condition recordedDate MUST be full ISO-8601 dateTime with timezone
+                if ($recorded !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $recorded)) {
+                    $recorded .= 'T00:00:00+07:00';
+                }
+                if (empty($recorded)) {
+                    $fallbackDate = $row['tgl_registrasi'] ?? ($patient['tgl_registrasi'] ?? date('Y-m-d'));
+                    $fallbackTime = $row['jam_reg'] ?? ($patient['jam_reg'] ?? '00:00:00');
+                    $recorded = \SatuSehatPayloadBuilder::sanitizeDateTime($fallbackDate, $fallbackTime);
+                    if ($recorded !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $recorded)) {
+                        $recorded .= 'T00:00:00+07:00';
+                    }
+                }
+
+                if ($onset !== '' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $onset)) {
+                    $onset .= 'T00:00:00+07:00';
+                }
+                if (empty($onset)) {
+                    $onset = $recorded;
+                }
+
                 $p = [
                     'resourceType' => 'Condition',
                     'clinicalStatus' => [
@@ -494,17 +589,13 @@ class PayloadAdapter
                     ],
                     'subject' => [
                         'reference' => 'Patient/' . $ihs['pasien'],
-                        'display' => $patient['nm_pasien'],
+                        'display' => (string) ($patient['nm_pasien'] ?? ''),
                     ],
                     'encounter' => [
                         'reference' => 'Encounter/' . ($row['id_encounter'] ?? ''),
                     ],
-                    'onsetDateTime' => \SatuSehatPayloadBuilder::sanitizeDateTime(
-                        $row['tgl_perawatan'] ?? null, $row['jam_rawat'] ?? null, $row
-                    ),
-                    'recordedDate' => \SatuSehatPayloadBuilder::sanitizeDateTime(
-                        $row['tgl_perawatan'] ?? null, $row['jam_rawat'] ?? null, $row
-                    ),
+                    'onsetDateTime' => $onset,
+                    'recordedDate' => $recorded,
                     'recorder' => [
                         'reference' => 'Practitioner/' . $ihs['dokter'],
                         'display' => (string) ($row['nm_dokter'] ?? ''),

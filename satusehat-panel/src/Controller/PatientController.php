@@ -464,7 +464,7 @@ class PatientController
      * type that has data, marks it 'available' (can be sent) or 'sent'
      * (already has an id in the satu_sehat_* mapping table).
      */
-    private static function buildResourceManifest(string $noRawat, array $patient): array
+    public static function buildResourceManifest(string $noRawat, array $patient): array
     {
         $db = Database::getMysql();
         $manifest = [];
