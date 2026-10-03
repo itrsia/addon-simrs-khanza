@@ -160,6 +160,8 @@ $labP = [
 $lab = SatuSehatPayloadBuilder::observationLab($labP, 'P1', 'PR1', 'org-1');
 ok(($lab['valueQuantity']['code'] ?? '') === 'mg/dL', 'lab mapped unit mg/dL → UCUM code');
 ok(($lab['code']['coding'][0]['code'] ?? '') === '20570-8', "lab LOINC code trimmed ('20570-8 ' → '20570-8')");
+ok(isset($lab['issued']) && $lab['issued'] === '2024-01-01T10:00:00+07:00', 'lab payload carries issued matching result datetime');
+ok($lab['issued'] === $lab['effectiveDateTime'], 'lab issued matches effectiveDateTime');
 
 $labP['satuan'] = 'pes'; // unmappable unit
 $lab2 = SatuSehatPayloadBuilder::observationLab($labP, 'P1', 'PR1', 'org-1');

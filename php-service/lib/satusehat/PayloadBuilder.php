@@ -2825,6 +2825,7 @@ class SatuSehatPayloadBuilder
                 'reference' => 'Specimen/' . $p['id_specimen']
             ],
             'effectiveDateTime' => $dateTimeStr,
+            'issued'            => $dateTimeStr,
         ];
 
         if ($numeric !== null && $ucumCode !== null) {
